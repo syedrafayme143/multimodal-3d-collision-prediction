@@ -1,0 +1,12 @@
+# Exclude the dataset completely from Git tracking
+data/raw_nuscenes/
+data/processed/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Virtual environment and IDE files
+.venv/
+.vscode/
+.ipynb_checkpoints/
