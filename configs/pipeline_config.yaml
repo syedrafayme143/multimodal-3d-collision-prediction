@@ -1,0 +1,17 @@
+# configs/pipeline_config.yaml
+
+dataset:
+  name: "nuscenes-mini"
+  raw_path: "./data/raw_nuscenes"
+  processed_path: "./data/processed"
+  
+  # Structural splits required by your project instructions
+  split_proportions:
+    train: 0.70       # 70% of total scenes for weight updates
+    validation: 0.15  # 15% of total scenes for hyperparameter adjustment
+    test: 0.15        # 15% of total scenes for unbiased grading performance
+
+detector:
+  model_name: "bevfusion"
+  classes: ["car"]
+  confidence_threshold: 0.40
