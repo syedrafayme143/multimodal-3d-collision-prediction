@@ -1,0 +1,255 @@
+"""
+src/run_detector.py
+
+Runs CenterPoint 3D object detection over the test-split scenes of nuScenes-mini,
+keeps only 'car' detections above a confidence threshold, and exports them in a
+flat JSON schema consumed by the downstream Kalman-filter tracking node.
+
+Intended invocation (from repo root):
+    conda run -n mmdet3d python src/run_detector.py --config configs/pipeline_config.yaml
+"""
+
+import os
+import sys
+import json
+import logging
+from pathlib import Path
+
+import yaml
+import numpy as np
+from tqdm import tqdm
+
+from nuscenes.nuscenes import NuScenes
+from mmdet3d.apis import init_model, inference_detector
+
+# Make sure `src/` is importable regardless of the caller's CWD.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from create_splits import generate_scene_splits  # noqa: E402
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("run_detector")
+
+# Internal MMDetection3D framework config for the checkpoint architecture.
+MODEL_CONFIG_PATH = (
+    "mmdetection3d/configs/centerpoint/"
+    "centerpoint_02pillar_second_secfpn_circlenms_4x8_cyclic_20e_nus.py"
+)
+
+TARGET_CLASS = "car"
+
+
+def load_config(config_path: str) -> dict:
+    logger.info("Loading pipeline config from %s", config_path)
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    return cfg
+
+
+def get_test_scene_names(cfg: dict) -> set:
+    """
+    Fetches the scenes from create_splits.py using positional tuple unpacking
+    to match the output of your custom sequence-level split logic.
+    """
+    # Unpack the 3 positional arguments returned by your generate_scene_splits function
+    _, _, test_scenes_list = generate_scene_splits()
+    test_scenes = set(test_scenes_list)
+    
+    if not test_scenes:
+        raise ValueError(
+            "generate_scene_splits() returned no scenes for the test split."
+        )
+    logger.info("Loaded %d scenes for the test split.", len(test_scenes))
+    return test_scenes
+
+
+def resolve_car_class_index(model) -> int:
+    """
+    Determine the label index corresponding to 'car' from the model's own
+    class metadata instead of assuming a fixed ordering.
+    """
+    class_names = None
+    if hasattr(model, "dataset_meta") and model.dataset_meta:
+        class_names = model.dataset_meta.get("classes")
+    if class_names is None and hasattr(model, "CLASSES"):
+        class_names = model.CLASSES
+
+    if class_names is None:
+        logger.warning(
+            "Could not read class metadata from model; defaulting to index 0 "
+            "for 'car' (standard nuScenes CenterPoint ordering)."
+        )
+        return 0
+
+    class_names = list(class_names)
+    if TARGET_CLASS not in class_names:
+        raise ValueError(
+            f"'{TARGET_CLASS}' not found in model class list: {class_names}"
+        )
+    return class_names.index(TARGET_CLASS)
+
+
+def iter_test_samples(nusc: NuScenes, test_scene_names: set):
+    """
+    Yields (sample_token, sample_dict) for every keyframe sample belonging to
+    scenes in the test split, in scene/temporal order.
+    """
+    for scene in nusc.scene:
+        if scene["name"] not in test_scene_names:
+            continue
+
+        sample_token = scene["first_sample_token"]
+        while sample_token:
+            sample = nusc.get("sample", sample_token)
+            yield sample_token, sample
+            sample_token = sample["next"]
+
+
+def get_lidar_pointcloud_path(nusc: NuScenes, sample: dict) -> str:
+    lidar_token = sample["data"]["LIDAR_TOP"]
+    lidar_data = nusc.get("sample_data", lidar_token)
+    return os.path.join(nusc.dataroot, lidar_data["filename"])
+
+
+def get_camera_intrinsics(nusc: NuScenes, sample: dict) -> dict:
+    """
+    Extracts per-camera intrinsic matrices for this sample. CenterPoint itself
+    is LiDAR-only, but intrinsics are pulled through so downstream fusion
+    stages (and inference_detector's input dict) have access to them.
+    """
+    intrinsics = {}
+    for cam_name, cam_token in sample["data"].items():
+        if not cam_name.startswith("CAM"):
+            continue
+        cam_data = nusc.get("sample_data", cam_token)
+        calib = nusc.get(
+            "calibrated_sensor", cam_data["calibrated_sensor_token"]
+        )
+        intrinsics[cam_name] = calib["camera_intrinsic"]
+    return intrinsics
+
+
+def extract_car_detections(result, car_class_idx: int, score_thresh: float) -> list:
+    """
+    Normalizes an MMDetection3D `Det3DDataSample` result into a list of
+    car-only detection dicts matching the export schema.
+    """
+    pred = result.pred_instances_3d
+
+    scores = pred.scores_3d.cpu().numpy()
+    labels = pred.labels_3d.cpu().numpy()
+    # LiDARInstance3DBoxes tensor columns: x, y, z, dx, dy, dz, yaw, (vx, vy) optionally
+    boxes = pred.bboxes_3d.tensor.cpu().numpy()
+
+    detections = []
+    for i in range(len(scores)):
+        if labels[i] != car_class_idx:
+            continue
+        if scores[i] < score_thresh:
+            continue
+
+        x, y, z, dx, dy, dz, yaw = boxes[i, :7]
+        detections.append(
+            {
+                "class": TARGET_CLASS,
+                "score": float(round(float(scores[i]), 4)),
+                "x": float(x),
+                "y": float(y),
+                "z": float(z),
+                "size": [float(dx), float(dy), float(dz)],
+                "yaw": float(yaw),
+            }
+        )
+    return detections
+
+
+def run(config_path: str):
+    cfg = load_config(config_path)
+
+    nusc_cfg = cfg.get("nuscenes", {})
+    model_cfg = cfg.get("model", {})
+    detection_cfg = cfg.get("detection", {})
+    output_cfg = cfg.get("output", {})
+
+    dataroot = nusc_cfg.get("dataroot", "./data/raw_nuscenes")
+    version = nusc_cfg.get("version", "v1.0-mini")
+    checkpoint_path = model_cfg.get(
+        "checkpoint", "checkpoints/centerpoint_voxel_nuscenes.pth"
+    )
+    confidence_threshold = float(detection_cfg.get("confidence_threshold", 0.40))
+    output_path = output_cfg.get(
+        "raw_detections_path", "./data/processed/raw_detections.json"
+    )
+
+    # --- Data & splits -----------------------------------------------------
+    test_scene_names = get_test_scene_names(cfg)
+
+    logger.info("Initializing NuScenes(version=%s, dataroot=%s)", version, dataroot)
+    nusc = NuScenes(version=version, dataroot=dataroot, verbose=True)
+
+    # --- Model ---------------------------------------------------------------
+    logger.info(
+        "Initializing CenterPoint model from %s / %s",
+        MODEL_CONFIG_PATH,
+        checkpoint_path,
+    )
+    model = init_model(MODEL_CONFIG_PATH, checkpoint_path, device="cuda")
+    car_class_idx = resolve_car_class_index(model)
+    logger.info("Resolved '%s' -> class index %d", TARGET_CLASS, car_class_idx)
+
+    # --- Inference loop --------------------------------------------------
+    samples = list(iter_test_samples(nusc, test_scene_names))
+    logger.info("Running inference over %d test-split keyframes.", len(samples))
+
+    all_frames = []
+    for sample_token, sample in tqdm(samples, desc="Running CenterPoint inference"):
+        pcd_path = get_lidar_pointcloud_path(nusc, sample)
+        _camera_intrinsics = get_camera_intrinsics(nusc, sample)  # noqa: F841
+
+        result, _data = inference_detector(model, pcd_path)
+
+        car_detections = extract_car_detections(
+            result, car_class_idx, confidence_threshold
+        )
+
+        all_frames.append(
+            {
+                "frame_id": sample_token,
+                "timestamp": int(sample["timestamp"]),
+                "detections": car_detections,
+            }
+        )
+
+    # --- Export ------------------------------------------------------------
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out_path, "w") as f:
+        json.dump(all_frames, f, indent=2)
+
+    total_dets = sum(len(f["detections"]) for f in all_frames)
+    logger.info(
+        "Wrote %d frames (%d car detections total) to %s",
+        len(all_frames),
+        total_dets,
+        out_path,
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Run CenterPoint 3D detection over nuScenes-mini test split."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/pipeline_config.yaml",
+        help="Path to pipeline_config.yaml",
+    )
+    args = parser.parse_args()
+
+    run(args.config)
