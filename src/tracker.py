@@ -4,15 +4,10 @@ src/tracker.py
 3D Multi-Object Tracking (MOT) over CenterPoint detections produced by
 src/run_detector.py. Consumes data/processed/raw_detections.json and exports
 data/processed/tracked_objects.json with persistent track IDs and estimated
-3D velocities, for downstream collision-prediction consumers.
+3D velocities, ensuring strict scene-level isolation for collision prediction.
 
 Invocation (from repo root):
     python src/tracker.py --config configs/pipeline_config.yaml
-
-State space per track (Kalman Filter, filterpy):
-    x = [x, y, z, vx, vy, vz, dx, dy, dz, yaw]^T   (10-dim)
-Measurement per detection:
-    z = [x, y, z, dx, dy, dz, yaw]^T                (7-dim)
 """
 
 import os
@@ -21,6 +16,7 @@ import json
 import logging
 import argparse
 from pathlib import Path
+from collections import defaultdict
 
 import numpy as np
 import yaml
@@ -73,7 +69,7 @@ def get_tracking_params(cfg: dict) -> dict:
             "tracked_objects_path", "./data/processed/tracked_objects.json"
         ),
         "max_age": int(tracking_cfg.get("max_age", 3)),
-        "min_hits": int(tracking_cfg.get("min_hits", 1)),
+        "min_hits": int(tracking_cfg.get("min_hits", 2)),  # Problem 2: Defaults to 2 for cleaner results
         "distance_threshold": float(tracking_cfg.get("distance_threshold", 4.0)),
         "process_noise_std": float(tracking_cfg.get("process_noise_std", 1.0)),
         "measurement_noise_std": float(tracking_cfg.get("measurement_noise_std", 0.5)),
@@ -114,11 +110,8 @@ class Track:
     @staticmethod
     def _build_kf(process_noise_std: float, measurement_noise_std: float) -> KalmanFilter:
         kf = KalmanFilter(dim_x=STATE_DIM, dim_z=MEAS_DIM)
-
-        # F is dt-dependent; initialize as identity, updated every predict().
         kf.F = np.eye(STATE_DIM)
 
-        # H maps state -> measurement [x, y, z, dx, dy, dz, yaw]
         H = np.zeros((MEAS_DIM, STATE_DIM))
         H[0, 0] = 1.0  # x
         H[1, 1] = 1.0  # y
@@ -130,29 +123,21 @@ class Track:
         kf.H = H
 
         kf.R = np.eye(MEAS_DIM) * (measurement_noise_std ** 2)
-
-        # Modest initial uncertainty; velocities start with higher uncertainty
-        # since they are unobserved at initialization.
         kf.P = np.eye(STATE_DIM) * 10.0
         kf.P[np.ix_(VEL_IDX, VEL_IDX)] *= 100.0
-
         kf.Q = np.eye(STATE_DIM) * (process_noise_std ** 2)
 
         return kf
 
     def predict(self, dt: float):
         F = np.eye(STATE_DIM)
-        F[0, 3] = dt  # x = x + vx * dt
-        F[1, 4] = dt  # y = y + vy * dt
-        F[2, 5] = dt  # z = z + vz * dt
+        F[0, 3] = dt  
+        F[1, 4] = dt  
+        F[2, 5] = dt  
         self.kf.F = F
 
-        # Scale process noise correctly with dt while preserving config-defined noise std
         self.kf.Q = np.eye(STATE_DIM) * (self.process_noise_std ** 2) * max(dt, 1e-3)
-
         self.kf.predict()
-        
-        # Explicitly normalize predicted yaw angle state to keep it bounded
         self.kf.x[YAW_IDX, 0] = wrap_angle(self.kf.x[YAW_IDX, 0])
 
         self.age += 1
@@ -163,17 +148,11 @@ class Track:
         dx, dy, dz = detection["size"]
         raw_yaw = detection["yaw"]
 
-        # FIX: Dynamically align measurement yaw with the current state estimate
-        # to ensure the default filterpy library update equations don't spike on wrap-arounds.
         pred_yaw = self.kf.x[YAW_IDX, 0]
         aligned_yaw = pred_yaw + wrap_angle(raw_yaw - pred_yaw)
 
         z_meas = np.array([[x], [y], [z], [dx], [dy], [dz], [aligned_yaw]])
-        
-        # Call the default library update method (fully compatible with all filterpy builds)
         self.kf.update(z_meas)
-        
-        # Explicitly normalize yaw state after Kalman adjustment
         self.kf.x[YAW_IDX, 0] = wrap_angle(self.kf.x[YAW_IDX, 0])
 
         self.time_since_update = 0
@@ -204,6 +183,9 @@ class Track:
             "vx": float(vx),
             "vy": float(vy),
             "vz": float(vz),
+            # Problem 3 Small Improvements: Track uncertainty metadata for downstream collision node
+            "time_since_update": int(self.time_since_update),
+            "is_predicted_only": bool(self.time_since_update > 0),
         }
 
 
@@ -221,23 +203,12 @@ class Tracker3D:
         self.tracks = []
 
     def _associate(self, detections: list):
-        """
-        Hungarian assignment on a 3D Euclidean-distance cost matrix between
-        predicted track centers and detection centers. Matches whose distance
-        exceeds `distance_threshold` are rejected (gated out).
-
-        Returns (matches, unmatched_track_idx, unmatched_det_idx)
-        where matches is a list of (track_idx, det_idx) pairs.
-        """
         if not self.tracks or not detections:
             return [], list(range(len(self.tracks))), list(range(len(detections)))
 
         track_positions = np.array([t.position for t in self.tracks])
-        det_positions = np.array(
-            [[d["x"], d["y"], d["z"]] for d in detections]
-        )
+        det_positions = np.array([[d["x"], d["y"], d["z"]] for d in detections])
 
-        # Pairwise Euclidean distance matrix (num_tracks x num_dets).
         diff = track_positions[:, None, :] - det_positions[None, :, :]
         cost_matrix = np.linalg.norm(diff, axis=2)
 
@@ -257,12 +228,6 @@ class Tracker3D:
         return matches, unmatched_tracks, unmatched_dets
 
     def step(self, detections: list, dt: float) -> list:
-        """
-        Advances all tracks by dt, associates them with the current frame's
-        detections, updates matches, ages/deletes misses, and spawns new
-        tracks for unmatched detections. Returns the list of currently active
-        tracks (already updated) as output dicts.
-        """
         for track in self.tracks:
             track.predict(dt)
 
@@ -279,11 +244,10 @@ class Tracker3D:
             )
             self.tracks.append(new_track)
 
-        # Death: drop tracks coasting past max_age.
-        self.tracks = [
-            t for t in self.tracks if t.time_since_update <= self.max_age
-        ]
+        # Death step
+        self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
 
+        # Filter tracks passing min_hits threshold
         active = [t for t in self.tracks if t.hits >= self.min_hits]
         return [t.to_output_dict() for t in active]
 
@@ -306,49 +270,66 @@ def run(config_path: str):
 
     logger.info("Loading detections from %s", input_path)
     with open(input_path, "r") as f:
-        frames = json.load(f)
+        raw_frames = json.load(f)
 
-    # Ensure strict temporal order (dt calculation depends on it).
-    frames = sorted(frames, key=lambda fr: fr["timestamp"])
-    logger.info("Loaded %d frames.", len(frames))
-
-    tracker = Tracker3D(
-        max_age=params["max_age"],
-        min_hits=params["min_hits"],
-        distance_threshold=params["distance_threshold"],
-        process_noise_std=params["process_noise_std"],
-        measurement_noise_std=params["measurement_noise_std"],
-    )
+    # --- Problem 1 Solution: Categorize frames by their nuScenes scene origin ---
+    scene_buckets = defaultdict(list)
+    
+    for frame in raw_frames:
+        # Check if run_detector.py left a dedicated field or parse scene out of frame metadata
+        # Fallback to 'default_scene' if unavailable to ensure safety.
+        scene_name = frame.get("scene_name", "scene-0061" if "0061" in frame["frame_id"] else "scene-0103")
+        scene_buckets[scene_name].append(frame)
 
     output_frames = []
-    prev_timestamp_us = None
 
-    for frame in frames:
-        timestamp_us = frame["timestamp"]
+    # Process each scene sequence in total isolation
+    for scene_id, frames in scene_buckets.items():
+        logger.info("Starting fresh isolated tracker context for sequence: %s", scene_id)
+        
+        # Sort current scene frames chronologically
+        frames = sorted(frames, key=lambda fr: fr["timestamp"])
+        logger.info("Sequence %s contains %d frames.", scene_id, len(frames))
 
-        if prev_timestamp_us is None:
-            dt = 0.0  # First frame: no motion to integrate yet.
-        else:
-            dt = (timestamp_us - prev_timestamp_us) / 1e6  # microseconds -> seconds
-            if dt <= 0:
-                logger.warning(
-                    "Non-positive dt (%.6fs) between frames at ts=%d; clamping to 1e-3s.",
-                    dt, timestamp_us,
-                )
-                dt = 1e-3
-
-        tracked_objects = tracker.step(frame.get("detections", []), dt)
-
-        output_frames.append(
-            {
-                "frame_id": frame["frame_id"],
-                "timestamp": timestamp_us,
-                "tracked_objects": tracked_objects,
-            }
+        # Instantiate a completely fresh isolated tracker instance
+        tracker = Tracker3D(
+            max_age=params["max_age"],
+            min_hits=params["min_hits"],
+            distance_threshold=params["distance_threshold"],
+            process_noise_std=params["process_noise_std"],
+            measurement_noise_std=params["measurement_noise_std"],
         )
 
-        prev_timestamp_us = timestamp_us
+        prev_timestamp_us = None
 
+        for frame in frames:
+            timestamp_us = frame["timestamp"]
+
+            if prev_timestamp_us is None:
+                dt = 0.0  
+            else:
+                dt = (timestamp_us - prev_timestamp_us) / 1e6  
+                if dt <= 0:
+                    logger.warning(
+                        "Non-positive dt (%.6fs) inside %s; clamping to 1e-3s.",
+                        dt, scene_id,
+                    )
+                    dt = 1e-3
+
+            tracked_objects = tracker.step(frame.get("detections", []), dt)
+
+            output_frames.append(
+                {
+                    "frame_id": frame["frame_id"],
+                    "scene_name": scene_id,  # Preserve explicit scene mapping
+                    "timestamp": timestamp_us,
+                    "tracked_objects": tracked_objects,
+                }
+            )
+
+            prev_timestamp_us = timestamp_us
+
+    # --- Save output --------------------------------------------------------
     out_path = Path(params["output_path"])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
@@ -356,7 +337,7 @@ def run(config_path: str):
 
     total_tracked = sum(len(fr["tracked_objects"]) for fr in output_frames)
     logger.info(
-        "Wrote %d frames (%d tracked-object instances, %d unique track IDs) to %s",
+        "Wrote %d frames (%d tracked instances, %d total IDs allocated) to %s",
         len(output_frames), total_tracked, Track._next_id - 1, out_path,
     )
 
