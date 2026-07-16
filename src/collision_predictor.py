@@ -55,11 +55,11 @@ def get_collision_params(cfg: dict) -> dict:
         ),
         "prediction_horizon": float(cp_cfg.get("prediction_horizon", 3.0)),
         "time_step": float(cp_cfg.get("time_step", 0.1)),
-        "safety_buffer_x": float(cp_cfg.get("safety_buffer_x", 1.0)),
-        "safety_buffer_y": float(cp_cfg.get("safety_buffer_y", 0.5)),
+        "safety_buffer_x": float(cp_cfg.get("safety_buffer_x", 1.0)),  # longitudinal (along x-axis)
+        "safety_buffer_y": float(cp_cfg.get("safety_buffer_y", 0.5)),  # lateral (along y-axis)
         "risk_score_threshold": float(cp_cfg.get("risk_score_threshold", 0.6)),
-        "ego_length": float(cp_cfg.get("ego_length", 4.5)),  # local y-axis (length/heading)
-        "ego_width": float(cp_cfg.get("ego_width", 2.0)),    # local x-axis (width/lateral)
+        "ego_length": float(cp_cfg.get("ego_length", 4.5)),  # local x-axis (forward/backward)
+        "ego_width": float(cp_cfg.get("ego_width", 2.0)),    # local y-axis (left/right)
         # How aggressively safety buffers widen per missed update on a
         # predicted-only (coasting) track, to account for accumulating drift.
         "drift_degradation_factor": float(
@@ -76,20 +76,20 @@ def get_collision_params(cfg: dict) -> dict:
 # --------------------------------------------------------------------------
 # Oriented Bounding Box geometry (2D, top-down / BEV)
 # --------------------------------------------------------------------------
-def obb_corners(cx: float, cy: float, half_width: float, half_length: float,
+def obb_corners(cx: float, cy: float, half_length: float, half_width: float,
                 yaw: float) -> np.ndarray:
     """
     Returns the 4 corners (4x2 array) of a 2D oriented box centered at (cx, cy).
     
     Convention Alignment Fix:
-    - local_corners maps local x-axis to width and local y-axis to length.
-    - Yaw is rotated correctly relative to heading.
+    - local_corners maps local x-axis to length (forward/backward) and local y-axis to width (left/right)[cite: 2].
+    - Yaw is rotated correctly relative to the longitudinal heading direction[cite: 2].
     """
     local_corners = np.array([
-        [half_width, half_length],
-        [half_width, -half_length],
-        [-half_width, -half_length],
-        [-half_width, half_length],
+        [half_length, half_width],
+        [half_length, -half_width],
+        [-half_length, -half_width],
+        [-half_length, half_width],
     ])
     c, s = np.cos(yaw), np.sin(yaw)
     rot = np.array([[c, -s], [s, c]])
@@ -117,7 +117,7 @@ def obb_intersect(corners_a: np.ndarray, corners_b: np.ndarray) -> bool:
             axis = np.array([-edge[1], edge[0]])
             norm = np.linalg.norm(axis)
             
-            # FIX: Zero-division guard for coincident or corrupted corner states
+            # Zero-division guard for coincident or corrupted corner states
             if norm < 1e-9:
                 continue
             axis = axis / norm
@@ -160,15 +160,16 @@ def evaluate_track_collision(track: dict, params: dict) -> Optional[dict]:
     safety_buffer_x = params["safety_buffer_x"] * degradation_scale
     safety_buffer_y = params["safety_buffer_y"] * degradation_scale
 
-    # Ego dimensions: length along y-axis, width along x-axis
-    ego_half_width = params["ego_width"] / 2.0 + safety_buffer_y
+    # Ego dimensions aligned to standard LiDAR coordinate systems:
+    # Length (forward/backward) is along the x-axis, Width (left/right) is along the y-axis[cite: 2].
     ego_half_length = params["ego_length"] / 2.0 + safety_buffer_x
-    ego_corners = obb_corners(0.0, 0.0, ego_half_width, ego_half_length, 0.0)
+    ego_half_width = params["ego_width"] / 2.0 + safety_buffer_y
+    ego_corners = obb_corners(0.0, 0.0, ego_half_length, ego_half_width, 0.0)
 
-    # size = [dx, dy, dz] = [width, length, height]
-    dx, dy, _dz = track["size"]
-    track_half_width = dx / 2.0
-    track_half_length = dy / 2.0
+    # size = [length, width, height] unpacked correctly[cite: 2].
+    length, width, _dz = track["size"]
+    track_half_length = length / 2.0
+    track_half_width = width / 2.0
 
     x0, y0 = track["x"], track["y"]
     vx, vy = track.get("vx", 0.0), track.get("vy", 0.0)
@@ -183,8 +184,9 @@ def evaluate_track_collision(track: dict, params: dict) -> Optional[dict]:
         x_t = x0 + vx * t
         y_t = y0 + vy * t
 
+        # Use realigned dimensions in correct x/y geometric order
         track_corners = obb_corners(
-            x_t, y_t, track_half_width, track_half_length, yaw
+            x_t, y_t, track_half_length, track_half_width, yaw
         )
 
         if obb_intersect(ego_corners, track_corners):
