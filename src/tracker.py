@@ -51,17 +51,6 @@ def wrap_angle(angle: float) -> float:
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
 
-def angle_residual(a, b):
-    """
-    Custom residual function for the Kalman Filter update step.
-    Computes the measurement residual y = z - Hx while cleanly wrapping
-    the yaw angle difference (index 6) to prevent wrap-around bugs.
-    """
-    res = a - b
-    res[6, 0] = wrap_angle(res[6, 0])
-    return res
-
-
 # --------------------------------------------------------------------------
 # Config Loading
 # --------------------------------------------------------------------------
@@ -158,12 +147,12 @@ class Track:
         F[2, 5] = dt  # z = z + vz * dt
         self.kf.F = F
 
-        # FIX: Scaling process noise correctly with dt while preserving config-defined noise std
+        # Scale process noise correctly with dt while preserving config-defined noise std
         self.kf.Q = np.eye(STATE_DIM) * (self.process_noise_std ** 2) * max(dt, 1e-3)
 
         self.kf.predict()
         
-        # FIX: Explicitly normalize predicted yaw angle state to keep it bounded
+        # Explicitly normalize predicted yaw angle state to keep it bounded
         self.kf.x[YAW_IDX, 0] = wrap_angle(self.kf.x[YAW_IDX, 0])
 
         self.age += 1
@@ -172,14 +161,19 @@ class Track:
     def update(self, detection: dict):
         x, y, z = detection["x"], detection["y"], detection["z"]
         dx, dy, dz = detection["size"]
-        yaw = wrap_angle(detection["yaw"])
+        raw_yaw = detection["yaw"]
 
-        z_meas = np.array([[x], [y], [z], [dx], [dy], [dz], [yaw]])
+        # FIX: Dynamically align measurement yaw with the current state estimate
+        # to ensure the default filterpy library update equations don't spike on wrap-arounds.
+        pred_yaw = self.kf.x[YAW_IDX, 0]
+        aligned_yaw = pred_yaw + wrap_angle(raw_yaw - pred_yaw)
+
+        z_meas = np.array([[x], [y], [z], [dx], [dy], [dz], [aligned_yaw]])
         
-        # FIX: Pass custom residual function to resolve yaw wrap-around spikes
-        self.kf.update(z_meas, residual_fn=angle_residual)
+        # Call the default library update method (fully compatible with all filterpy builds)
+        self.kf.update(z_meas)
         
-        # FIX: Explicitly normalize yaw state after Kalman adjustment
+        # Explicitly normalize yaw state after Kalman adjustment
         self.kf.x[YAW_IDX, 0] = wrap_angle(self.kf.x[YAW_IDX, 0])
 
         self.time_since_update = 0
