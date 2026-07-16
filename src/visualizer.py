@@ -15,12 +15,6 @@ Produces:
 
 Invocation from repo root:
     python src/visualizer.py --config configs/pipeline_config.yaml
-
-Coordinate convention:
-    - Ego vehicle is drawn at origin (0, 0).
-    - x-axis = forward/backward direction.
-    - y-axis = left/right direction.
-    - Track size = [dx, dy, dz] = [length, width, height].
 """
 
 import argparse
@@ -56,7 +50,6 @@ logger = logging.getLogger("visualizer")
 # --------------------------------------------------------------------------
 def load_config(config_path: str) -> dict:
     """Load YAML pipeline configuration."""
-
     logger.info("Loading pipeline config from %s", config_path)
 
     config_file = Path(config_path)
@@ -71,7 +64,6 @@ def load_config(config_path: str) -> dict:
 
 def get_visualizer_params(cfg: dict) -> dict:
     """Read visualizer, nuScenes, output, and ego-vehicle settings."""
-
     vis_cfg = cfg.get("visualizer", {})
     nusc_cfg = cfg.get("nuscenes", {})
     output_cfg = cfg.get("output", {})
@@ -107,14 +99,14 @@ def get_visualizer_params(cfg: dict) -> dict:
             vis_cfg.get("velocity_arrow_scale", 1.0)
         ),
 
-        # Ego dimensions.
-        # x-axis = length direction, y-axis = width direction.
+        # Ego dimensions:
+        # In standard nuScenes coordinates, length is along y-axis, width is along x-axis.
         "ego_length": float(collision_cfg.get("ego_length", 4.5)),
         "ego_width": float(collision_cfg.get("ego_width", 2.0)),
 
         # Safety buffer around ego vehicle.
-        "safety_buffer_x": float(collision_cfg.get("safety_buffer_x", 1.0)),
-        "safety_buffer_y": float(collision_cfg.get("safety_buffer_y", 0.5)),
+        "safety_buffer_x": float(collision_cfg.get("safety_buffer_x", 1.0)), # longitudinal (Y)
+        "safety_buffer_y": float(collision_cfg.get("safety_buffer_y", 0.5)), # lateral (X)
     }
 
     validate_visualizer_params(params)
@@ -123,7 +115,6 @@ def get_visualizer_params(cfg: dict) -> dict:
 
 def validate_visualizer_params(params: dict) -> None:
     """Validate visualizer config values."""
-
     if len(params["canvas_xlim"]) != 2:
         raise ValueError("canvas_xlim must contain exactly two values.")
 
@@ -157,7 +148,6 @@ def validate_visualizer_params(params: dict) -> None:
 # --------------------------------------------------------------------------
 def load_json(path: str) -> list:
     """Load a JSON file and require it to contain a list."""
-
     json_path = Path(path)
 
     if not json_path.exists():
@@ -173,12 +163,7 @@ def load_json(path: str) -> list:
 
 
 def merge_pipeline_frames(tracked_frames: list, collision_frames: list) -> list:
-    """
-    Merge tracked_objects.json and collision_predictions.json by frame_id.
-
-    The tracked frame order is preserved.
-    """
-
+    """Merge tracked_objects.json and collision_predictions.json by frame_id."""
     collision_by_frame = {fr["frame_id"]: fr for fr in collision_frames}
 
     merged = []
@@ -218,13 +203,7 @@ def load_lidar_points_2d(
     frame_id: str,
     downsample_rate: int,
 ) -> np.ndarray | None:
-    """
-    Load and downsample top-down LIDAR_TOP points for one nuScenes sample token.
-
-    Returns:
-        Nx2 array containing x and y coordinates, or None if loading fails.
-    """
-
+    """Load and downsample top-down LIDAR_TOP points for one nuScenes sample token."""
     try:
         sample = nusc.get("sample", frame_id)
         lidar_token = sample["data"]["LIDAR_TOP"]
@@ -255,27 +234,26 @@ def add_obb_patch(
     ax,
     cx: float,
     cy: float,
-    length: float,
-    width: float,
+    width: float,  # Local x-axis in rendering (horizontal width)
+    length: float, # Local y-axis in rendering (vertical length)
     yaw: float,
     **kwargs,
 ):
     """
     Add an oriented rectangle in BEV.
-
-    length is along local x-axis.
-    width is along local y-axis.
-    yaw rotates the box around its center.
+    
+    Corrected mapping to match nuScenes coordinate layout:
+    - width is drawn along the horizontal axis (X).
+    - length is drawn along the vertical axis (Y).
     """
-
     rect = patches.Rectangle(
-        (cx - length / 2.0, cy - width / 2.0),
-        length,
-        width,
+        (float(cx - width / 2.0), float(cy - length / 2.0)),
+        float(width),
+        float(length),
         **kwargs,
     )
 
-    transform = mtransforms.Affine2D().rotate_around(cx, cy, yaw) + ax.transData
+    transform = mtransforms.Affine2D().rotate_around(float(cx), float(cy), float(yaw)) + ax.transData
     rect.set_transform(transform)
     ax.add_patch(rect)
 
@@ -284,7 +262,6 @@ def add_obb_patch(
 
 def get_track_color(track_id: int, scene_color_map: dict, colormap_name: str):
     """Assign a stable color to each track ID within one scene."""
-
     colormap = plt.get_cmap(colormap_name)
     n_colors = colormap.N if hasattr(colormap, "N") else 20
 
@@ -313,14 +290,12 @@ class BEVRenderer:
 
     def _reset_for_new_scene(self, scene_name: str) -> None:
         """Reset color mapping and scene state when a new scene starts."""
-
         logger.info("Resetting BEV state for new sequence: %s", scene_name)
         self.scene_color_map = {}
         self.current_scene = scene_name
 
     def render_frame(self, frame_idx: int, frame: dict):
         """Render one animation frame."""
-
         if frame["scene_name"] != self.current_scene:
             self._reset_for_new_scene(frame["scene_name"])
 
@@ -371,15 +346,17 @@ class BEVRenderer:
             zone_color = "green"
             zone_alpha = 0.15
 
-        zone_length = self.params["ego_length"] + 2 * self.params["safety_buffer_x"]
+        # CORRECT COORDINATES:
+        # X is width (lateral), Y is length (longitudinal).
         zone_width = self.params["ego_width"] + 2 * self.params["safety_buffer_y"]
+        zone_length = self.params["ego_length"] + 2 * self.params["safety_buffer_x"]
 
         add_obb_patch(
             ax,
             cx=0.0,
             cy=0.0,
-            length=zone_length,
             width=zone_width,
+            length=zone_length,
             yaw=0.0,
             facecolor=zone_color,
             edgecolor=zone_color,
@@ -387,13 +364,13 @@ class BEVRenderer:
             zorder=2,
         )
 
-        # 3. Ego vehicle.
+        # 3. Ego vehicle (realigned vertically to fit the point cloud occlusion shadow).
         add_obb_patch(
             ax,
             cx=0.0,
             cy=0.0,
-            length=self.params["ego_length"],
             width=self.params["ego_width"],
+            length=self.params["ego_length"],
             yaw=0.0,
             facecolor="blue",
             edgecolor="cyan",
@@ -422,8 +399,8 @@ class BEVRenderer:
                 logger.debug("Skipping track %s due to invalid size.", track_id)
                 continue
 
-            # Correct convention:
-            # size = [dx, dy, dz] = [length, width, height]
+            # Correct convention aligned to standard axes:
+            # size is [length, width, height]
             length = float(size[0])
             width = float(size[1])
 
@@ -431,12 +408,13 @@ class BEVRenderer:
             y = float(track["y"])
             yaw = float(track.get("yaw", 0.0))
 
+            # Since length is along Y-axis and width along X-axis, map width to horizontal, length to vertical.
             add_obb_patch(
                 ax,
                 cx=x,
                 cy=y,
-                length=length,
                 width=width,
+                length=length,
                 yaw=yaw,
                 facecolor=color,
                 edgecolor="white",
@@ -466,7 +444,7 @@ class BEVRenderer:
             # Track ID label.
             ax.text(
                 x,
-                y + width / 2.0 + 1.0,
+                y + length / 2.0 + 1.0,
                 str(track_id),
                 color=color,
                 fontsize=8,
@@ -530,7 +508,6 @@ class BEVRenderer:
 # --------------------------------------------------------------------------
 def run(config_path: str) -> None:
     """Run BEV video rendering."""
-
     cfg = load_config(config_path)
     params = get_visualizer_params(cfg)
 
@@ -573,10 +550,9 @@ def run(config_path: str) -> None:
 
     if not animation.writers.is_available("ffmpeg"):
         raise RuntimeError(
-            "ffmpeg writer is not available. Install ffmpeg first, for example:\n"
-            "  apt-get install ffmpeg\n"
-            "or\n"
-            "  conda install -c conda-forge ffmpeg"
+            "ffmpeg writer is not available. Please install ffmpeg using your terminal:\n"
+            "  On Linux/Colab: !apt-get install -y ffmpeg\n"
+            "  On Conda: conda install -c conda-forge ffmpeg"
         )
 
     def update(frame_idx: int):
