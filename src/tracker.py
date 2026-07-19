@@ -15,6 +15,13 @@ Invocation (from repo root):
 
 import os
 import sys
+
+# --- FIX: Purge Colab/Jupyter inline backend environment variables ---
+os.environ.pop("MPLBACKEND", None)
+
+import matplotlib
+matplotlib.use("Agg")  # Set headless backend before any pyplot/nuscenes import
+
 import json
 import logging
 import argparse
