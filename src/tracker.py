@@ -6,6 +6,9 @@ src/run_detector.py. Consumes data/processed/raw_detections.json and exports
 data/processed/tracked_objects.json with persistent track IDs and estimated
 3D velocities, ensuring strict scene-level isolation for collision prediction.
 
+Converts coordinates from Global UTM space to local LiDAR frame space using 
+nuScenes calibration logs to ensure data validation compatibility.
+
 Invocation (from repo root):
     python src/tracker.py --config configs/pipeline_config.yaml
 """
@@ -22,6 +25,8 @@ import numpy as np
 import yaml
 from scipy.optimize import linear_sum_assignment
 from filterpy.kalman import KalmanFilter
+from nuscenes.nuscenes import NuScenes
+from pyquaternion import Quaternion
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +52,39 @@ def wrap_angle(angle: float) -> float:
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
 
+def transform_global_to_local(detection: dict, ego_pose: dict, calibrated_sensor: dict) -> dict:
+    """
+    Transforms a global UTM detection into the local LiDAR coordinate frame[cite: 2].
+    """
+    # 1. Extract position vector
+    global_pos = np.array([detection["x"], detection["y"], detection["z"]])
+    
+    # Global to Ego Transformation: v_ego = inv(q_ego) * (v_global - t_ego)[cite: 2]
+    q_ego_inv = Quaternion(ego_pose["rotation"]).inverse
+    ego_pos = q_ego_inv.rotate(global_pos - np.array(ego_pose["translation"]))
+    
+    # Ego to LiDAR Transformation: v_sensor = inv(q_cs) * (v_ego - t_cs)[cite: 2]
+    q_cs_inv = Quaternion(calibrated_sensor["rotation"]).inverse
+    local_pos = q_cs_inv.rotate(ego_pos - np.array(calibrated_sensor["translation"]))
+    
+    # 2. Extract and transform yaw orientation quaternion[cite: 2]
+    global_quat = Quaternion(axis=[0, 0, 1], angle=detection["yaw"])
+    local_quat = q_cs_inv * q_ego_inv * global_quat
+    
+    # Extract the local yaw angle by mapping a forward vector
+    v_forward = local_quat.rotate(np.array([1.0, 0.0, 0.0]))
+    local_yaw = np.arctan2(v_forward[1], v_forward[0])
+    
+    # Return modified local detection copy
+    local_detection = detection.copy()
+    local_detection["x"] = float(local_pos[0])
+    local_detection["y"] = float(local_pos[1])
+    local_detection["z"] = float(local_pos[2])
+    local_detection["yaw"] = float(wrap_angle(local_yaw))
+    
+    return local_detection
+
+
 # --------------------------------------------------------------------------
 # Config Loading
 # --------------------------------------------------------------------------
@@ -69,7 +107,7 @@ def get_tracking_params(cfg: dict) -> dict:
             "tracked_objects_path", "./data/processed/tracked_objects.json"
         ),
         "max_age": int(tracking_cfg.get("max_age", 3)),
-        "min_hits": int(tracking_cfg.get("min_hits", 2)),  # Problem 2: Defaults to 2 for cleaner results
+        "min_hits": int(tracking_cfg.get("min_hits", 2)),
         "distance_threshold": float(tracking_cfg.get("distance_threshold", 4.0)),
         "process_noise_std": float(tracking_cfg.get("process_noise_std", 1.0)),
         "measurement_noise_std": float(tracking_cfg.get("measurement_noise_std", 0.5)),
@@ -77,7 +115,7 @@ def get_tracking_params(cfg: dict) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Single track wrapping a filterpy KalmanFilter
+# Single track wrapping a filterpy KalmanFilter[cite: 1]
 # --------------------------------------------------------------------------
 class Track:
     _next_id = 1
@@ -183,14 +221,13 @@ class Track:
             "vx": float(vx),
             "vy": float(vy),
             "vz": float(vz),
-            # Problem 3 Small Improvements: Track uncertainty metadata for downstream collision node
             "time_since_update": int(self.time_since_update),
             "is_predicted_only": bool(self.time_since_update > 0),
         }
 
 
 # --------------------------------------------------------------------------
-# Tracker manager: association + lifecycle across frames
+# Tracker manager: association + lifecycle across frames[cite: 1]
 # --------------------------------------------------------------------------
 class Tracker3D:
     def __init__(self, max_age: int, min_hits: int, distance_threshold: float,
@@ -253,11 +290,20 @@ class Tracker3D:
 
 
 # --------------------------------------------------------------------------
-# Main pipeline
+# Main pipeline[cite: 1]
 # --------------------------------------------------------------------------
 def run(config_path: str):
     cfg = load_config(config_path)
     params = get_tracking_params(cfg)
+
+    # Initialize NuScenes Instance to acquire localized transform frames[cite: 2]
+    nusc_cfg = cfg.get("nuscenes", {})
+    logger.info("Initializing NuScenes interface for tracking frame transformations...")
+    nusc = NuScenes(
+        version=nusc_cfg.get("version", "v1.0-mini"),
+        dataroot=nusc_cfg.get("dataroot", "./data/raw_nuscenes"),
+        verbose=False
+    )
 
     logger.info(
         "Tracking params: max_age=%d, min_hits=%d, distance_threshold=%.2fm",
@@ -272,26 +318,23 @@ def run(config_path: str):
     with open(input_path, "r") as f:
         raw_frames = json.load(f)
 
-    # --- Problem 1 Solution: Categorize frames by their nuScenes scene origin ---
+    # Categorize frames by their nuScenes scene origin[cite: 1]
     scene_buckets = defaultdict(list)
-    
     for frame in raw_frames:
-        # Check if run_detector.py left a dedicated field or parse scene out of frame metadata
-        # Fallback to 'default_scene' if unavailable to ensure safety.
         scene_name = frame.get("scene_name", "scene-0061" if "0061" in frame["frame_id"] else "scene-0103")
         scene_buckets[scene_name].append(frame)
 
     output_frames = []
 
-    # Process each scene sequence in total isolation
+    # Process each scene sequence in total isolation[cite: 1]
     for scene_id, frames in scene_buckets.items():
         logger.info("Starting fresh isolated tracker context for sequence: %s", scene_id)
         
-        # Sort current scene frames chronologically
+        # Sort current scene frames chronologically[cite: 1]
         frames = sorted(frames, key=lambda fr: fr["timestamp"])
         logger.info("Sequence %s contains %d frames.", scene_id, len(frames))
 
-        # Instantiate a completely fresh isolated tracker instance
+        # Instantiate a completely fresh isolated tracker instance[cite: 1]
         tracker = Tracker3D(
             max_age=params["max_age"],
             min_hits=params["min_hits"],
@@ -304,6 +347,20 @@ def run(config_path: str):
 
         for frame in frames:
             timestamp_us = frame["timestamp"]
+            frame_id = frame["frame_id"]
+
+            # Acquire vehicle transformation metrics relative to coordinate origin[cite: 2]
+            sample = nusc.get("sample", frame_id)
+            lidar_token = sample["data"]["LIDAR_TOP"]
+            lidar_data = nusc.get("sample_data", lidar_token)
+            ego_pose = nusc.get("ego_pose", lidar_data["ego_pose_token"])
+            calibrated_sensor = nusc.get("calibrated_sensor", lidar_data["calibrated_sensor_token"])
+
+            # Map raw detections from Global UTM space into Local LiDAR frame space[cite: 2]
+            local_detections = []
+            for det in frame.get("detections", []):
+                local_det = transform_global_to_local(det, ego_pose, calibrated_sensor)
+                local_detections.append(local_det)
 
             if prev_timestamp_us is None:
                 dt = 0.0  
@@ -316,12 +373,12 @@ def run(config_path: str):
                     )
                     dt = 1e-3
 
-            tracked_objects = tracker.step(frame.get("detections", []), dt)
+            tracked_objects = tracker.step(local_detections, dt)
 
             output_frames.append(
                 {
-                    "frame_id": frame["frame_id"],
-                    "scene_name": scene_id,  # Preserve explicit scene mapping
+                    "frame_id": frame_id,
+                    "scene_name": scene_id,
                     "timestamp": timestamp_us,
                     "tracked_objects": tracked_objects,
                 }
